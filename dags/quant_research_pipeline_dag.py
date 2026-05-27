@@ -6,18 +6,18 @@
   0) preflight   : init_workspace(setup) → check_trading_day(@task.branch)
                      ├─ 휴장일 → market_closed → finalize 로 바로 합류
                      └─ 개장일 → open_session → 1단계로
-  1) ingest      : 4개 원천 병렬 수집(fan-out), 각 원천마다 validate 순차 연결
+  1) ingest      : 5개 원천 병렬 수집(fan-out), 각 원천마다 validate 순차 연결
                      - ingest_prices 는 flaky → retries + 지수 백오프(재시작 데모)
-  2) consolidate : 4갈래 합류(fan-in, trigger_rule)
+  2) consolidate : 5갈래 합류(fan-in, trigger_rule)
   3) route_quality(@task.branch) : 데이터 완전성으로 3갈래
                      ├─ FULL     → proceed_full      (정식 피처/모델 경로)
                      ├─ DEGRADED → proceed_degraded  (경량 신호만)
                      └─ ABORT    → abort_low_quality (종료)
-  4) features    : TaskGroup 안에서 4개 피처 병렬 계산 → assemble_features(fan-in)
+  4) features    : TaskGroup 안에서 5개 피처 병렬 계산 → assemble_features(fan-in)
   5) universe    : 동적 태스크 매핑(.expand) — 섹터 N개를 동시 채점 → rank_sectors
   6) model       : train → [backtest ∥ risk_check] 병렬 → validate_model(gate)
                      - train_model 도 가끔 실패 → 재시도 데모
-  7) publish     : [publish_signals ∥ update_dashboard ∥ archive ∥ report] 병렬
+  7) publish     : [publish_signals ∥ update_dashboard ∥ archive(+report)] 병렬
   8) finalize    : 모든 경로 합류(trigger_rule) → close_session(teardown)
 
 데모 포인트 요약:
@@ -39,7 +39,7 @@ from datetime import datetime, timedelta
 from airflow.sdk import dag, task, task_group
 
 # 원천/섹터 등 상수 — 실제론 Variable/Connection/Config 에서 주입
-SOURCES = ["prices", "fundamentals", "news", "fx"]
+SOURCES = ["prices", "fundamentals", "news", "fx", "altdata"]   # v2: altdata 원천 추가
 SECTORS = ["tech", "financials", "energy", "healthcare", "consumer", "industrials"]
 
 default_args = {
@@ -86,9 +86,10 @@ def daily_quant_research_pipeline():
         return "closed"
 
     @task
-    def open_session(run_id: str) -> dict:
-        print(f"[preflight] 세션 오픈 (run_id={run_id})")
-        return {"run_id": run_id, "opened_at": time.time()}
+    def open_session(workspace: str) -> dict:
+        # ⚠️ 파라미터명 'run_id'는 Airflow 예약 컨텍스트 키와 충돌 → 'workspace' 사용
+        print(f"[preflight] 세션 오픈 (workspace={workspace})")
+        return {"workspace": workspace, "opened_at": time.time()}
 
     # ============================================================
     # 1) INGEST — 원천 4개 병렬 수집 + 원천별 검증 순차
@@ -118,6 +119,12 @@ def daily_quant_research_pipeline():
         return {"source": "fx", "rows": random.randint(50, 120)}
 
     @task
+    def ingest_altdata(session: dict) -> dict:
+        """v2 추가 원천 — 대안 데이터(위성/카드/웹트래픽 등). 종종 비어 옴."""
+        time.sleep(random.uniform(1, 2))
+        return {"source": "altdata", "rows": random.randint(0, 500)}
+
+    @task
     def validate(raw: dict) -> dict:
         """원천별 스키마/건수 검증 — 각 ingest 바로 뒤에 순차로 붙음."""
         ok = raw["rows"] > 0
@@ -128,12 +135,14 @@ def daily_quant_research_pipeline():
     # 2) CONSOLIDATE — 4갈래 합류 (fan-in)
     # ============================================================
     @task(trigger_rule="all_success")
-    def consolidate(prices: dict, fundamentals: dict, news: dict, fx: dict) -> dict:
-        parts = [prices, fundamentals, news, fx]
+    def consolidate(*sources: dict) -> dict:
+        # v2: 원천 개수가 늘어도(altdata 추가) 시그니처 고정되도록 가변인자로 변경
+        parts = list(sources)
         ok_sources = [p["source"] for p in parts if p["ok"]]
         total = sum(p["rows"] for p in parts)
         completeness = len(ok_sources) / len(parts)
-        print(f"[consolidate] total_rows={total} ok={ok_sources} completeness={completeness:.0%}")
+        print(f"[consolidate] {len(parts)}개 원천 total_rows={total} "
+              f"ok={ok_sources} completeness={completeness:.0%}")
         return {"total": total, "completeness": completeness, "ok_sources": ok_sources}
 
     # ============================================================
@@ -199,15 +208,22 @@ def daily_quant_research_pipeline():
             return {"liq": round(random.uniform(0, 1), 4)}
 
         @task
-        def assemble_features(r: dict, v: dict, m: dict, l: dict) -> dict:
-            feats = {**r, **v, **m, **l}
+        def compute_sentiment(c: dict) -> dict:
+            """v2 추가 피처 — news/altdata 기반 감성 점수."""
+            time.sleep(random.uniform(0.5, 1.5))
+            return {"sentiment": round(random.uniform(-1, 1), 4)}
+
+        @task
+        def assemble_features(*parts: dict) -> dict:
+            # v2: 피처가 늘어도 시그니처 고정되도록 가변인자로 합류
+            feats = {k: v for p in parts for k, v in p.items()}
             print(f"[features] assembled={feats}")
             return feats
 
-        # 4개 병렬 계산 후 합류
+        # 5개 병렬 계산 후 합류
         return assemble_features(
-            compute_returns(c), compute_volatility(c),
-            compute_momentum(c), compute_liquidity(c),
+            compute_returns(c), compute_volatility(c), compute_momentum(c),
+            compute_liquidity(c), compute_sentiment(c),
         )
 
     # ============================================================
@@ -282,12 +298,9 @@ def daily_quant_research_pipeline():
         print("[publish] 대시보드 갱신")
 
     @task
-    def archive_artifacts(run_id: str) -> None:
-        print(f"[publish] 산출물 아카이브 (run_id={run_id})")
-
-    @task
-    def send_report() -> None:
-        print("[publish] 리포트 발송")
+    def archive_artifacts(workspace: str) -> None:
+        # v2: send_report 를 제거하고 아카이브 시 리포트 발송까지 통합
+        print(f"[publish] 산출물 아카이브 + 리포트 발송 (workspace={workspace})")
 
     # ============================================================
     # 8) FINALIZE — 모든 경로 합류 + teardown
@@ -299,20 +312,20 @@ def daily_quant_research_pipeline():
         return "done"
 
     @task
-    def close_session(run_id: str) -> None:
+    def close_session(workspace: str) -> None:
         """세션/리소스 정리 (teardown) — upstream 실패해도 항상 실행 보장."""
-        print(f"[teardown] 세션 종료 및 정리 (run_id={run_id})")
+        print(f"[teardown] 세션 종료 및 정리 (workspace={workspace})")
 
     # ============================================================
     # 의존성 와이어링
     # ============================================================
     # --- 0) preflight ---
-    run_id = init_workspace()
-    setup = run_id.as_setup()              # setup 으로 표시
+    workspace = init_workspace()
+    setup = workspace.as_setup()           # setup 으로 표시
 
     trading = check_trading_day()
     closed = market_closed()
-    session = open_session(run_id)
+    session = open_session(workspace)
     setup >> trading
     trading >> [session, closed]           # 개장 분기
 
@@ -321,14 +334,16 @@ def daily_quant_research_pipeline():
     raw_fund = ingest_fundamentals(session)
     raw_news = ingest_news(session)
     raw_fx = ingest_fx(session)
+    raw_alt = ingest_altdata(session)      # v2: 5번째 원천
 
     v_prices = validate(raw_prices)
     v_fund = validate(raw_fund)
     v_news = validate(raw_news)
     v_fx = validate(raw_fx)
+    v_alt = validate(raw_alt)              # v2
 
-    # --- 2) consolidate (fan-in) ---
-    consolidated = consolidate(v_prices, v_fund, v_news, v_fx)
+    # --- 2) consolidate (fan-in, 5갈래) ---
+    consolidated = consolidate(v_prices, v_fund, v_news, v_fx, v_alt)
 
     # --- 3) route_quality (분기) ---
     route = route_quality(consolidated)
@@ -359,15 +374,14 @@ def daily_quant_research_pipeline():
     published = publish_signals(verdict)
     [verdict, quick] >> published          # 어느 경로든 하나 성공이면 진행
     dash = update_dashboard()
-    arch = archive_artifacts(run_id)
-    report = send_report()
-    published >> [dash, arch, report]      # 병렬 후처리
+    arch = archive_artifacts(workspace)    # v2: 아카이브+리포트 통합 (send_report 제거)
+    published >> [dash, arch]              # 병렬 후처리
 
     # --- 8) finalize (모든 경로 합류) + teardown ---
     done = finalize()
-    [dash, arch, report, closed, aborted] >> done
+    [dash, arch, closed, aborted] >> done
 
-    teardown = close_session(run_id)
+    teardown = close_session(workspace)
     teardown.as_teardown(setups=setup)     # setup↔teardown 짝
     done >> teardown
 
