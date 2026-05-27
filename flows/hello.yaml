@@ -1,0 +1,7 @@
+id: hello_from_git
+namespace: git
+
+tasks:
+  - id: say_hello
+    type: io.kestra.plugin.core.log.Log
+    message: "Hello from Git! (v1) synced at {{ now() }}"
