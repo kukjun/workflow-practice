@@ -1,0 +1,31 @@
+id: master_graph
+namespace: git
+description: |
+  미리 만들어 둔 flow들을 Subflow로 조립한 "마스터 그래프".
+  부품 flow(hello_from_git, data_pipeline_demo)를 업데이트하면 여기에 자동 반영된다.
+  Topology 뷰에서 각 Subflow를 접으면 서브그래프, 펼치면 내부까지 전체 그래프로 보인다.
+
+inputs:
+  - id: threshold
+    type: INT
+    defaults: 20
+
+tasks:
+  - id: run_pipeline
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: git
+    flowId: data_pipeline_demo     # 미리 만든 flow를 부품으로 호출
+    wait: true                     # 끝날 때까지 기다림
+    inputs:
+      threshold: "{{ inputs.threshold }}"   # 상위 입력을 서브플로우로 전달
+    # revision: 3                  # 특정 버전 고정하려면 주석 해제 (기본은 최신)
+
+  - id: run_hello
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: git
+    flowId: hello_from_git
+    wait: true
+
+  - id: done
+    type: io.kestra.plugin.core.log.Log
+    message: "두 서브플로우 완료 → 마스터 그래프 종료"
