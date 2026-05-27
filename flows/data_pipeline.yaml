@@ -1,0 +1,52 @@
+id: data_pipeline_demo
+namespace: git
+description: |
+  입력값을 받아 → Python으로 숫자를 생성·집계하고 → 임계값에 따라 분기하는 샘플 파이프라인.
+  Kestra의 핵심 개념(입력·Python 컨테이너 실행·온더플라이 의존성 설치·출력 전달·조건분기)을 한 flow에 담았다.
+
+# 1) 입력 — 실행 시점에 값을 받는다 (기본값 있음)
+inputs:
+  - id: threshold
+    type: INT
+    defaults: 20
+
+tasks:
+  # 2) extract — Python을 별도 컨테이너(python:3.11-slim)에서 실행.
+  #    beforeCommands로 'kestra' 패키지를 그 자리에서 설치 → Qore의 uv sync(P2)와 같은 그림.
+  #    {{ inputs.threshold }} 가 스크립트 본문에 그대로 주입된다 (Kestra가 템플릿 렌더).
+  - id: extract
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.11-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install kestra
+    script: |
+      import random
+      from kestra import Kestra
+
+      threshold = {{ inputs.threshold }}
+      numbers = [random.randint(1, 10) for _ in range(5)]
+      total = sum(numbers)
+      level = "HIGH" if total > threshold else "LOW"
+
+      # Kestra.outputs(...) 로 내보낸 값은 outputs.extract.vars.<key> 로 참조된다
+      Kestra.outputs({"numbers": numbers, "total": total, "level": level})
+
+  # 3) decide — 앞 단계의 출력(level)으로 분기 (문자열 비교라 타입 이슈 없음)
+  - id: decide
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.extract.vars.level == 'HIGH' }}"
+    then:
+      - id: on_high
+        type: io.kestra.plugin.core.log.Log
+        message: "HIGH 경로 — 합계 {{ outputs.extract.vars.total }} > 임계값 {{ inputs.threshold }}"
+    else:
+      - id: on_low
+        type: io.kestra.plugin.core.log.Log
+        message: "LOW 경로 — 합계 {{ outputs.extract.vars.total }} <= 임계값 {{ inputs.threshold }}"
+
+  # 4) summary — 항상 마지막에 실행. 앞 단계 출력을 참조 (데이터 전달 시연)
+  - id: summary
+    type: io.kestra.plugin.core.log.Log
+    message: "처리한 숫자={{ outputs.extract.vars.numbers }} / 등급={{ outputs.extract.vars.level }}"

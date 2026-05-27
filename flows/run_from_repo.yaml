@@ -1,0 +1,46 @@
+id: run_from_repo
+namespace: git
+description: |
+  레포를 clone → 의존성 설치 → 레포 안의 .py 파일을 실행한다.
+  (= Qore의 clone → uv sync → 실행 모델. 코드는 YAML 밖 jobs/*.py 에 있음)
+  실행 시점에 entrypoint 입력으로 "어떤 파일을 돌릴지" 고른다.
+
+inputs:
+  # 어떤 .py 를 돌릴지 선택 — jobs/ 안에 파일이 여러 개면 여기서 바꿔 고른다
+  - id: entrypoint
+    type: STRING
+    defaults: jobs/report.py
+  # 그 스크립트에 넘길 인자
+  - id: rows
+    type: INT
+    defaults: 5
+
+tasks:
+  # WorkingDirectory: 안쪽 태스크들이 같은 작업 디렉터리를 공유.
+  # → clone 한 파일을 run 단계가 그대로 쓸 수 있다 (이게 없으면 태스크마다 디렉터리가 분리됨)
+  - id: workspace
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      - id: clone
+        type: io.kestra.plugin.git.Clone
+        url: https://github.com/<your-user>/<your-repo>
+        branch: main
+        # private 레포면 아래 두 줄 추가:
+        # username: <your-user>
+        # password: "{{ secret('GITHUB_ACCESS_TOKEN') }}"
+
+      - id: run
+        type: io.kestra.plugin.scripts.python.Commands
+        containerImage: python:3.11-slim
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        beforeCommands:
+          - pip install -r requirements.txt     # ← 레포의 requirements 로 의존성 설치
+        commands:
+          - python {{ inputs.entrypoint }} --rows {{ inputs.rows }}   # ← 고른 파일 실행
+        outputFiles:
+          - result.json     # 스크립트가 남긴 파일을 Kestra가 캡처
+
+  - id: show
+    type: io.kestra.plugin.core.log.Log
+    message: "결과 파일 URI → {{ outputs.run.outputFiles['result.json'] }}"
